@@ -8,9 +8,10 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import started from "electron-squirrel-startup";
 import { randomUUID } from "node:crypto";
-
+import { updateElectronApp } from "update-electron-app";
 import { ResourceInfo } from "./types";
 
+updateElectronApp();
 protocol.registerSchemesAsPrivileged([
   { scheme: "comfy-view", privileges: { supportFetchAPI: true, secure: true } },
 ]);
