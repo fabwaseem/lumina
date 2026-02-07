@@ -2,6 +2,10 @@
 
 Lumina is an open source desktop gallery for CivitAI images with ComfyUI integration.
 
+## Screenshot
+
+![Lumina Gallery Screenshot](docs/screenshot.jpg)
+
 ## Features
 
 - Browse CivitAI images with fast, responsive views
@@ -21,9 +25,14 @@ Get the latest release: https://github.com/fabwaseem/lumina/releases/latest
 
 ## Developer
 
-- Name: Waseem Anjum
-- Website: https://waseemanjum.com
-- Repository: https://github.com/fabwaseem/lumina
+## License & Credits
+
+Lumina is released under the MIT License. If you use or modify this project, please credit the original author:
+
+> Copyright © 2026 Waseem Anjum
+> https://waseemanjum.com
+
+See LICENSE for details.
 
 ## Requirements
 
