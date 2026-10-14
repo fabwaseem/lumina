@@ -38,6 +38,7 @@ import {
   getStoredCivitaiApiKey,
   setStoredCivitaiApiKey,
 } from "@/services/civitai";
+import { isHttpUrl, normalizeApiKey } from "@/lib/validate";
 import {
   getStoredDownloadPath,
   setStoredDownloadPath,
@@ -462,8 +463,10 @@ export function SettingsModal({
     const urlChanged = url !== previousUrl;
     const basePathChanged = basePath !== previousBasePath;
     if (urlChanged) {
-      if (!url) {
-        setComfySaveError("Server URL is required.");
+      if (!url || !isHttpUrl(url)) {
+        setComfySaveError(
+          "Enter a valid http or https URL for the ComfyUI server.",
+        );
         setComfySaving(false);
         setActiveTab("comfyui");
         return false;
@@ -530,8 +533,14 @@ export function SettingsModal({
 
   const handleSaveAll = async () => {
     setStoredDownloadPath(downloadPathInput.trim() || "lumina");
-    setStoredCivitaiApiKey(civitaiKeyInput.trim());
-    window.api.civitaiSetApiKey(civitaiKeyInput.trim());
+    const apiKey = normalizeApiKey(civitaiKeyInput);
+    if (apiKey == null) {
+      setComfySaveError("CivitAI API key contains invalid characters.");
+      setActiveTab("civitai");
+      return;
+    }
+    setStoredCivitaiApiKey(apiKey);
+    void window.api?.civitaiSetApiKey(apiKey);
     setAutoLora(autoLoraInput);
     setMaxDownloadSize(maxDownloadSizeInput);
     setMaxConcurrentDownloads(maxConcurrentDownloadsInput);
@@ -1099,6 +1108,12 @@ export function SettingsModal({
                     className="input w-full text-sm font-mono"
                     autoComplete="off"
                   />
+                  {comfySaveError && activeTab === "civitai" && (
+                    <div className="mt-3 flex items-start gap-2 rounded-xl bg-red-500/10 dark:bg-red-500/15 border border-red-500/20 dark:border-red-500/30 p-3 text-sm text-red-700 dark:text-red-400">
+                      <AlertCircle size={18} className="shrink-0 mt-0.5" />
+                      <span>{comfySaveError}</span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1120,16 +1135,16 @@ export function SettingsModal({
                         Website
                       </span>
                       <a
-                        href="https://waseemanjum.com"
+                        href="https://www.fabwaseem.com"
                         className="text-primary-600 dark:text-primary-400 hover:underline"
                         onClick={(event) => {
                           event.preventDefault();
-                          void window.api.openExternal(
-                            "https://waseemanjum.com",
+                          void window.api?.openExternal(
+                            "https://www.fabwaseem.com",
                           );
                         }}
                       >
-                        waseemanjum.com
+                        www.fabwaseem.com
                       </a>
                     </div>
                     <div className="flex items-center justify-between gap-3">

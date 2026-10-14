@@ -10,8 +10,24 @@ import started from "electron-squirrel-startup";
 import { randomUUID } from "node:crypto";
 import { updateElectronApp } from "update-electron-app";
 import { ResourceInfo } from "./types";
+import {
+  isCivitaiAssetUrl,
+  isHttpUrl,
+  isModelHash,
+  isPromptId,
+  isSafeComfyName,
+  normalizeApiKey,
+  parsePositiveInt,
+  sanitizeFilename,
+  sanitizeQuery,
+  sanitizeSaveFolder,
+} from "./lib/validate";
 
-updateElectronApp();
+try {
+  updateElectronApp();
+} catch (err) {
+  console.error("[update] failed to start", err);
+}
 protocol.registerSchemesAsPrivileged([
   { scheme: "comfy-view", privileges: { supportFetchAPI: true, secure: true } },
 ]);
@@ -57,6 +73,47 @@ const downloadHistory: ActiveDownload[] = [];
 let maxConcurrentDownloads = 3;
 let mainWindow: BrowserWindow | null = null;
 
+const API_TIMEOUT_MS = 20_000;
+const MAX_PROMPT_LENGTH = 20_000;
+const MAX_RESOURCES = 64;
+const MAX_IMAGE_BYTES = 40 * 1024 * 1024;
+const MAX_VIEW_BYTES = 40 * 1024 * 1024;
+
+function parseByteCount(value: string | null): number | null {
+  if (!value) return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return numeric;
+}
+
+async function readJson<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function civitaiHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (_civitaiApiKey) headers.Authorization = `Bearer ${_civitaiApiKey}`;
+  return headers;
+}
+
+function isInside(root: string, target: string): boolean {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  return (
+    relative === "" ||
+    (!relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
+function safeModelFilename(name: string, modelVersionId: number): string {
+  return sanitizeFilename(name, `model-${modelVersionId}.safetensors`);
+}
+
 function sendDownloadUpdate(download: ActiveDownload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("download:progress", {
@@ -72,6 +129,7 @@ function sendDownloadUpdate(download: ActiveDownload) {
       createdAt: download.createdAt,
       completedAt: download.completedAt,
       modelVersionId: download.modelVersionId,
+      hash: download.hash,
       resourceName: download.resourceName,
     });
   }
@@ -90,17 +148,15 @@ async function getModelVersionInfo(modelVersionId: number): Promise<{
   sizeKB?: number;
   baseModel?: string;
 } | null> {
+  const versionId = parsePositiveInt(modelVersionId);
+  if (!versionId) return null;
   try {
-    const headers: Record<string, string> = {};
-    if (_civitaiApiKey) {
-      headers["Authorization"] = `Bearer ${_civitaiApiKey}`;
-    }
     const res = await fetch(
-      `https://civitai.com/api/v1/model-versions/${modelVersionId}`,
-      { headers },
+      `https://civitai.com/api/v1/model-versions/${versionId}`,
+      { headers: civitaiHeaders(), signal: AbortSignal.timeout(API_TIMEOUT_MS) },
     );
     if (!res.ok) return null;
-    const data = (await res.json()) as {
+    const data = await readJson<{
       id: number;
       baseModel?: string;
       downloadUrl?: string;
@@ -110,13 +166,18 @@ async function getModelVersionInfo(modelVersionId: number): Promise<{
         downloadUrl?: string;
         sizeKB?: number;
       }>;
-    };
+    }>(res);
+    if (!data) return null;
     const primaryFile = data.files?.find((f) => f.primary) ?? data.files?.[0];
-    const filename = primaryFile?.name ?? `model-${modelVersionId}.safetensors`;
+    const filename = safeModelFilename(
+      primaryFile?.name ?? "",
+      versionId,
+    );
     const downloadUrl =
       primaryFile?.downloadUrl ??
       data.downloadUrl ??
-      `https://civitai.com/api/download/models/${modelVersionId}`;
+      `https://civitai.com/api/download/models/${versionId}`;
+    if (!isHttpUrl(downloadUrl)) return null;
     return {
       downloadUrl,
       filename,
@@ -129,49 +190,38 @@ async function getModelVersionInfo(modelVersionId: number): Promise<{
 }
 
 async function getModelVersionIdByHash(hash: string): Promise<number | null> {
+  if (!isModelHash(hash)) return null;
   try {
-    const headers: Record<string, string> = {};
-    if (_civitaiApiKey) {
-      headers["Authorization"] = `Bearer ${_civitaiApiKey}`;
-    }
     const res = await fetch(
-      `https://civitai.com/api/v1/model-versions/by-hash/${hash}`,
-      { headers },
+      `https://civitai.com/api/v1/model-versions/by-hash/${encodeURIComponent(hash)}`,
+      { headers: civitaiHeaders(), signal: AbortSignal.timeout(API_TIMEOUT_MS) },
     );
     if (!res.ok) return null;
-    const data = (await res.json()) as {
-      id?: number;
-      files?: Array<{ name: string; primary?: boolean }>;
-    };
-    return data.id;
+    const data = await readJson<{ id?: number }>(res);
+    return parsePositiveInt(data?.id);
   } catch {
     return null;
   }
 }
 
 async function searchModelByName(query: string): Promise<number | null> {
+  const safeQuery = sanitizeQuery(query);
+  if (!safeQuery) return null;
   try {
-    const headers: Record<string, string> = {};
-    if (_civitaiApiKey) {
-      headers["Authorization"] = `Bearer ${_civitaiApiKey}`;
-    }
     const res = await fetch(
       `https://civitai.com/api/v1/models?query=${encodeURIComponent(
-        query,
+        safeQuery,
       )}&types=LORA&limit=1`,
-      { headers },
+      { headers: civitaiHeaders(), signal: AbortSignal.timeout(API_TIMEOUT_MS) },
     );
     if (!res.ok) return null;
-    const data = (await res.json()) as {
+    const data = await readJson<{
       items: Array<{
         id: number;
         modelVersions?: Array<{ id: number }>;
       }>;
-    };
-    if (data.items && data.items.length > 0) {
-      return data.items[0].modelVersions?.[0]?.id ?? null;
-    }
-    return null;
+    }>(res);
+    return parsePositiveInt(data?.items?.[0]?.modelVersions?.[0]?.id);
   } catch {
     return null;
   }
@@ -236,6 +286,12 @@ async function startDownload(download: ActiveDownload): Promise<void> {
   sendDownloadUpdate(download);
 
   let url = download.url;
+  if (!isHttpUrl(url)) {
+    download.status = "failed";
+    download.error = "Invalid download URL";
+    sendDownloadUpdate(download);
+    return;
+  }
   if (_civitaiApiKey && url.includes("civitai.com")) {
     const separator = url.includes("?") ? "&" : "?";
     url = `${url}${separator}token=${encodeURIComponent(_civitaiApiKey)}`;
@@ -249,7 +305,10 @@ async function startDownload(download: ActiveDownload): Promise<void> {
   try {
     const res = await fetch(url, {
       headers,
-      signal: abortController.signal,
+      signal: AbortSignal.any([
+        abortController.signal,
+        AbortSignal.timeout(30 * 60 * 1000),
+      ]),
       redirect: "follow",
     });
 
@@ -260,16 +319,20 @@ async function startDownload(download: ActiveDownload): Promise<void> {
       return;
     }
 
+    if (download.bytesReceived > 0 && res.status === 200) {
+      download.bytesReceived = 0;
+    }
+
     const contentLength = res.headers.get("content-length");
     const contentRange = res.headers.get("content-range");
 
     if (contentRange) {
       const match = contentRange.match(/bytes \d+-\d+\/(\d+)/);
       if (match) {
-        download.totalBytes = parseInt(match[1], 10);
+        download.totalBytes = parseByteCount(match[1]);
       }
     } else if (contentLength && download.bytesReceived === 0) {
-      download.totalBytes = parseInt(contentLength, 10);
+      download.totalBytes = parseByteCount(contentLength);
     }
 
     if (!res.body) {
@@ -286,6 +349,14 @@ async function startDownload(download: ActiveDownload): Promise<void> {
     const writeStream = fs.createWriteStream(download.tempPath, { flags });
     const reader = res.body.getReader();
 
+    const writeChunk = async (chunk: Uint8Array) => {
+      if (writeStream.write(chunk)) return;
+      await new Promise<void>((resolve, reject) => {
+        writeStream.once("drain", () => resolve());
+        writeStream.once("error", reject);
+      });
+    };
+
     try {
       for (;;) {
         const currentStatus = download.status as DownloadStatus;
@@ -298,7 +369,7 @@ async function startDownload(download: ActiveDownload): Promise<void> {
         const { done, value } = await reader.read();
         if (done) break;
 
-        writeStream.write(value);
+        await writeChunk(value);
         download.bytesReceived += value.length;
 
         const now = Date.now();
@@ -386,6 +457,124 @@ function startQueuedDownloads() {
   }
 }
 
+function resolveDownloadDir(destDir: unknown): string | { error: string } {
+  if (destDir == null || destDir === "") return getLorasPath();
+  if (typeof destDir !== "string" || destDir.includes("\0")) {
+    return { error: "Invalid destination" };
+  }
+  const trimmed = destDir.trim();
+  if (!trimmed || trimmed.split(/[\\/]/).includes("..")) {
+    return { error: "Invalid destination" };
+  }
+  const resolved = path.resolve(trimmed);
+  if (resolved === path.parse(resolved).root) {
+    return { error: "Invalid destination" };
+  }
+  return resolved;
+}
+
+async function startModelDownload(params: {
+  hash?: string;
+  modelVersionId?: number;
+  resourceName?: string;
+  destDir?: string;
+}): Promise<{
+  id?: string;
+  filename?: string;
+  path?: string;
+  alreadyExists?: boolean;
+  error?: string;
+  success?: boolean;
+}> {
+  if (!params || typeof params !== "object") {
+    return { error: "Invalid download request" };
+  }
+  const resourceName =
+    typeof params.resourceName === "string" ? params.resourceName.trim() : "";
+  if (!resourceName || resourceName.length > 180) {
+    return { error: "Resource name is required" };
+  }
+  const hash = params.hash && isModelHash(params.hash) ? params.hash : undefined;
+  if (params.hash && !hash) return { error: "Invalid model hash" };
+  let modelVersionId = parsePositiveInt(params.modelVersionId) ?? undefined;
+
+  const existing = Array.from(activeDownloads.values()).find(
+    (d) =>
+      ((hash && d.hash === hash) ||
+        (modelVersionId && d.modelVersionId === modelVersionId)) &&
+      (d.status === "downloading" || d.status === "pending"),
+  );
+  if (existing) {
+    return { id: existing.id, error: "Already downloading" };
+  }
+
+  if (!modelVersionId && hash) {
+    modelVersionId = (await getModelVersionIdByHash(hash)) ?? undefined;
+  }
+
+  if (!modelVersionId) {
+    return { error: "Failed to get model version id" };
+  }
+  const versionInfo = await getModelVersionInfo(modelVersionId);
+
+  if (!versionInfo) {
+    return { error: "Failed to get model version info" };
+  }
+
+  const lorasPath = resolveDownloadDir(params.destDir);
+  if (typeof lorasPath !== "string") return lorasPath;
+  try {
+    fs.mkdirSync(lorasPath, { recursive: true });
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : "Failed to create folder",
+    };
+  }
+
+  const id = randomUUID();
+  const filename = versionInfo.filename;
+  const destPath = path.join(lorasPath, filename);
+  const tempPath = `${destPath}.download`;
+
+  let bytesReceived = 0;
+  try {
+    if (fs.existsSync(tempPath)) {
+      bytesReceived = fs.statSync(tempPath).size;
+    }
+    if (fs.existsSync(destPath)) {
+      return { id, path: destPath, alreadyExists: true, success: true };
+    }
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : "Could not inspect download path",
+    };
+  }
+
+  const download: ActiveDownload = {
+    id,
+    filename,
+    url: versionInfo.downloadUrl,
+    status: "pending",
+    bytesReceived,
+    totalBytes: null,
+    speed: 0,
+    progress: 0,
+    destPath,
+    tempPath,
+    createdAt: Date.now(),
+    modelVersionId,
+    hash,
+    resourceName,
+    lastSpeedUpdate: Date.now(),
+    lastBytesForSpeed: bytesReceived,
+  };
+
+  activeDownloads.set(id, download);
+  sendDownloadUpdate(download);
+  startQueuedDownloads();
+  return { id, filename, success: true };
+}
+
 ipcMain.handle(
   "download:start",
   async (
@@ -396,77 +585,7 @@ ipcMain.handle(
       resourceName: string;
       destDir?: string;
     },
-  ) => {
-    const { hash, resourceName, destDir } = params;
-    let { modelVersionId } = params;
-
-    const existing = Array.from(activeDownloads.values()).find(
-      (d) =>
-        ((hash && d.hash === hash) ||
-          (modelVersionId && d.modelVersionId === modelVersionId)) &&
-        d.status === "downloading",
-    );
-    if (existing) {
-      return { id: existing.id, error: "Already downloading" };
-    }
-
-    if (!modelVersionId && hash) {
-      modelVersionId = await getModelVersionIdByHash(hash);
-    }
-
-    if (!modelVersionId) {
-      return { error: "Failed to get model version id" };
-    }
-    const versionInfo = await getModelVersionInfo(modelVersionId);
-
-    if (!versionInfo) {
-      return { error: "Failed to get model version info" };
-    }
-
-    const lorasPath = destDir || getLorasPath();
-    fs.mkdirSync(lorasPath, { recursive: true });
-
-    const id = randomUUID();
-    const filename = versionInfo.filename;
-    const destPath = path.join(lorasPath, filename);
-    const tempPath = destPath + ".download";
-
-    let bytesReceived = 0;
-    if (fs.existsSync(tempPath)) {
-      const stats = fs.statSync(tempPath);
-      bytesReceived = stats.size;
-      console.log("[Download] resuming from", bytesReceived, "bytes");
-    }
-
-    if (fs.existsSync(destPath)) {
-      return { id, path: destPath, alreadyExists: true };
-    }
-
-    const download: ActiveDownload = {
-      id,
-      filename,
-      url: versionInfo.downloadUrl,
-      status: "pending",
-      bytesReceived,
-      totalBytes: null,
-      speed: 0,
-      progress: 0,
-      destPath,
-      tempPath,
-      createdAt: Date.now(),
-      modelVersionId,
-      resourceName,
-      lastSpeedUpdate: Date.now(),
-      lastBytesForSpeed: 0,
-    };
-
-    activeDownloads.set(id, download);
-    sendDownloadUpdate(download);
-
-    startQueuedDownloads();
-
-    return { id, filename };
-  },
+  ) => startModelDownload(params),
 );
 
 ipcMain.handle("download:setMaxConcurrent", (_e, value: number) => {
@@ -480,8 +599,13 @@ ipcMain.handle("download:setMaxConcurrent", (_e, value: number) => {
   return { success: true, value: safe };
 });
 
-ipcMain.handle("download:pause", (_e, id: string) => {
-  const download = activeDownloads.get(id);
+function requireDownloadId(id: unknown): string | null {
+  return typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id) ? id : null;
+}
+
+ipcMain.handle("download:pause", (_e, id: unknown) => {
+  const downloadId = requireDownloadId(id);
+  const download = downloadId ? activeDownloads.get(downloadId) : undefined;
   if (download && download.status === "downloading") {
     download.status = "paused";
     download.speed = 0;
@@ -493,8 +617,9 @@ ipcMain.handle("download:pause", (_e, id: string) => {
   return { success: false, error: "Download not found or not active" };
 });
 
-ipcMain.handle("download:resume", (_e, id: string) => {
-  const download = activeDownloads.get(id);
+ipcMain.handle("download:resume", (_e, id: unknown) => {
+  const downloadId = requireDownloadId(id);
+  const download = downloadId ? activeDownloads.get(downloadId) : undefined;
   if (download && download.status === "paused") {
     download.status = "pending";
     sendDownloadUpdate(download);
@@ -504,8 +629,9 @@ ipcMain.handle("download:resume", (_e, id: string) => {
   return { success: false, error: "Download not found or not paused" };
 });
 
-ipcMain.handle("download:cancel", (_e, id: string) => {
-  const download = activeDownloads.get(id);
+ipcMain.handle("download:cancel", (_e, id: unknown) => {
+  const downloadId = requireDownloadId(id);
+  const download = downloadId ? activeDownloads.get(downloadId) : undefined;
   if (download) {
     download.status = "cancelled";
     download.abortController?.abort();
@@ -516,7 +642,7 @@ ipcMain.handle("download:cancel", (_e, id: string) => {
         void 0;
       }
     }
-    activeDownloads.delete(id);
+    activeDownloads.delete(download.id);
     sendDownloadUpdate(download);
     startQueuedDownloads();
     return { success: true };
@@ -524,15 +650,18 @@ ipcMain.handle("download:cancel", (_e, id: string) => {
   return { success: false, error: "Download not found" };
 });
 
-ipcMain.handle("download:retry", async (_e, id: string) => {
-  const historyItem = downloadHistory.find((d) => d.id === id);
+ipcMain.handle("download:retry", async (_e, id: unknown) => {
+  const downloadId = requireDownloadId(id);
+  const historyItem = downloadId
+    ? downloadHistory.find((d) => d.id === downloadId)
+    : undefined;
   if (historyItem && historyItem.modelVersionId) {
     const idx = downloadHistory.indexOf(historyItem);
     if (idx > -1) downloadHistory.splice(idx, 1);
-
-    return ipcMain.emit("download:start", _e, {
+    return startModelDownload({
       modelVersionId: historyItem.modelVersionId,
-      resourceName: historyItem.resourceName,
+      resourceName: historyItem.resourceName || historyItem.filename,
+      hash: historyItem.hash,
     });
   }
   return { success: false, error: "Download not found in history" };
@@ -552,6 +681,7 @@ ipcMain.handle("download:list", () => {
     createdAt: d.createdAt,
     completedAt: d.completedAt,
     modelVersionId: d.modelVersionId,
+    hash: d.hash,
     resourceName: d.resourceName,
   }));
   const history = downloadHistory.map((d) => ({
@@ -567,6 +697,7 @@ ipcMain.handle("download:list", () => {
     createdAt: d.createdAt,
     completedAt: d.completedAt,
     modelVersionId: d.modelVersionId,
+    hash: d.hash,
     resourceName: d.resourceName,
   }));
   return { active, history };
@@ -577,14 +708,27 @@ ipcMain.handle("download:clearHistory", () => {
   return { success: true };
 });
 
-ipcMain.handle("download:openFolder", (_e, filePath: string) => {
-  if (fs.existsSync(filePath)) {
-    shell.showItemInFolder(filePath);
+ipcMain.handle("download:openFolder", (_e, filePath: unknown) => {
+  if (typeof filePath !== "string" || !filePath.trim() || filePath.includes("\0")) {
+    return { success: false, error: "Invalid path" };
+  }
+  const resolved = path.resolve(filePath);
+  const allowedRoots = [
+    app.getPath("downloads"),
+    getLorasPath(),
+    ...Array.from(activeDownloads.values()).map((item) => path.dirname(item.destPath)),
+    ...downloadHistory.map((item) => path.dirname(item.destPath)),
+  ];
+  if (!allowedRoots.some((root) => isInside(root, resolved))) {
+    return { success: false, error: "Path is outside the download folders" };
+  }
+  if (fs.existsSync(resolved)) {
+    shell.showItemInFolder(resolved);
     return { success: true };
   }
-  const dir = path.dirname(filePath);
-  if (fs.existsSync(dir)) {
-    shell.openPath(dir);
+  const dir = path.dirname(resolved);
+  if (allowedRoots.some((root) => isInside(root, dir)) && fs.existsSync(dir)) {
+    void shell.openPath(dir);
     return { success: true };
   }
   return { success: false, error: "Path not found" };
@@ -597,8 +741,14 @@ ipcMain.handle(
     params: { hash?: string; name?: string },
   ): Promise<{ exists: boolean; path?: string }> => {
     const lorasPath = getLorasPath();
-    const hash = params?.hash;
-    const name = params?.name;
+    const hash = isModelHash(params?.hash) ? params.hash : undefined;
+    const name =
+      typeof params?.name === "string" &&
+      params.name.length <= 180 &&
+      !params.name.includes("\0") &&
+      !/[\\/]/.test(params.name)
+        ? params.name
+        : "";
 
     if (hash) {
       const modelVersionId = await getModelVersionIdByHash(hash);
@@ -632,35 +782,59 @@ interface WorkflowNodeMapping {
   loraNodeId?: string;
 }
 
-ipcMain.handle("comfyui:setUrl", (_e, url: string | undefined) => {
-  if (url != null && typeof url === "string" && url.trim()) {
-    comfyUiBaseUrl = url.trim().replace(/\/$/, "") || DEFAULT_COMFYUI_URL;
+ipcMain.handle("comfyui:setUrl", (_e, url: unknown) => {
+  if (typeof url !== "string" || !url.trim()) {
+    return { success: false, error: "URL required" };
   }
+  const trimmed = url.trim().replace(/\/$/, "");
+  if (!isHttpUrl(trimmed)) {
+    return { success: false, error: "ComfyUI URL must be http or https" };
+  }
+  comfyUiBaseUrl = trimmed;
+  return { success: true };
 });
 
-ipcMain.handle("comfyui:setBasePath", (_e, basePath: string | undefined) => {
-  if (basePath == null || typeof basePath !== "string") return;
-  _comfyUiBasePath = basePath.trim().replace(/[/\\]+$/, "");
-});
-
-ipcMain.handle("civitai:setApiKey", (_e, key: string | undefined) => {
-  _civitaiApiKey = typeof key === "string" ? key.trim() : "";
-});
-
-ipcMain.handle("civitai:getVersionInfo", async (_e, modelVersionId: number) => {
-  return await getModelVersionInfo(modelVersionId);
-});
-
-ipcMain.handle("app:openExternal", async (_e, url: string) => {
-  try {
-    const parsed = new URL(url);
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      return { success: false, error: "Invalid URL" };
-    }
-    await shell.openExternal(parsed.toString());
+ipcMain.handle("comfyui:setBasePath", (_e, basePath: unknown) => {
+  if (basePath == null || basePath === "") {
+    _comfyUiBasePath = "";
     return { success: true };
-  } catch {
+  }
+  if (typeof basePath !== "string" || basePath.includes("\0")) {
+    return { success: false, error: "Invalid path" };
+  }
+  const trimmed = basePath.trim().replace(/[/\\]+$/, "");
+  if (trimmed && !path.isAbsolute(trimmed)) {
+    return { success: false, error: "Base path must be absolute" };
+  }
+  _comfyUiBasePath = trimmed;
+  return { success: true };
+});
+
+ipcMain.handle("civitai:setApiKey", (_e, key: unknown) => {
+  const normalized = normalizeApiKey(key);
+  if (normalized == null) return { success: false, error: "Invalid API key" };
+  _civitaiApiKey = normalized;
+  return { success: true };
+});
+
+ipcMain.handle("civitai:getVersionInfo", async (_e, modelVersionId: unknown) => {
+  const versionId = parsePositiveInt(modelVersionId);
+  if (!versionId) return null;
+  return await getModelVersionInfo(versionId);
+});
+
+ipcMain.handle("app:openExternal", async (_e, url: unknown) => {
+  if (typeof url !== "string" || !isHttpUrl(url)) {
     return { success: false, error: "Invalid URL" };
+  }
+  try {
+    await shell.openExternal(url);
+    return { success: true };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Could not open URL",
+    };
   }
 });
 
@@ -672,12 +846,15 @@ ipcMain.handle(
     suggestedName?: string,
     downloadPathSetting?: string,
   ): Promise<{ path?: string; error?: string }> => {
-    if (!url || typeof url !== "string") {
-      return { error: "URL required" };
+    if (!url || typeof url !== "string" || !isCivitaiAssetUrl(url)) {
+      return { error: "Only CivitAI image URLs can be downloaded" };
     }
-    const raw = (downloadPathSetting ?? "lumina").trim() || "lumina";
+    const raw = (downloadPathSetting ?? "lumina").split("\u0000").join("").trim() || "lumina";
+    if (raw.split(/[\\/]/).includes("..")) {
+      return { error: "Invalid download folder" };
+    }
     const dir = path.isAbsolute(raw)
-      ? raw
+      ? path.resolve(raw)
       : path.join(app.getPath("downloads"), raw);
     try {
       fs.mkdirSync(dir, { recursive: true });
@@ -686,19 +863,23 @@ ipcMain.handle(
         error: err instanceof Error ? err.message : "Failed to create folder",
       };
     }
-    let filename = suggestedName;
+    let filename = typeof suggestedName === "string" ? suggestedName : "";
     if (!filename || !/\.(png|jpe?g|webp|gif)$/i.test(filename)) {
       const ext =
         /\.(png|jpe?g|webp|gif)$/i.exec(url)?.[1]?.toLowerCase() ?? "png";
-      const base = filename?.replace(/\.[^.]+$/, "") ?? `image-${Date.now()}`;
+      const base = filename.replace(/\.[^.]+$/, "") || `image-${Date.now()}`;
       filename = `${base}.${ext}`;
     }
-    const safeName = filename.replace(/[<>:"/\\|?*]/g, "_");
+    const safeName = sanitizeFilename(filename, `image-${Date.now()}.png`);
     const filePath = path.join(dir, safeName);
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
       if (!res.ok) {
         return { error: res.statusText || "Download failed" };
+      }
+      const declaredSize = parseByteCount(res.headers.get("content-length"));
+      if (declaredSize != null && declaredSize > MAX_IMAGE_BYTES) {
+        return { error: "Image is too large to download" };
       }
       const body = res.body;
       if (!body) {
@@ -708,9 +889,21 @@ ipcMain.handle(
         body as Parameters<typeof Readable.fromWeb>[0],
       );
       const writeStream = fs.createWriteStream(filePath);
+      let received = 0;
+      nodeReadable.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        if (received > MAX_IMAGE_BYTES) {
+          nodeReadable.destroy(new Error("Image is too large to download"));
+        }
+      });
       await pipeline(nodeReadable, writeStream);
       return { path: filePath };
     } catch (err) {
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {
+        void 0;
+      }
       return {
         error: err instanceof Error ? err.message : "Download failed",
       };
@@ -724,18 +917,23 @@ ipcMain.handle(
     _e,
     basePath: string,
   ): { valid: boolean; lorasExists: boolean; outputExists: boolean } => {
-    const trimmed = (basePath ?? "").trim().replace(/[/\\]+$/, "");
+    if (typeof basePath !== "string" || basePath.includes("\0")) {
+      return { valid: false, lorasExists: false, outputExists: false };
+    }
+    const trimmed = basePath.trim().replace(/[/\\]+$/, "");
     if (!trimmed) {
       return { valid: true, lorasExists: false, outputExists: false };
     }
-    const lorasPath = path.join(trimmed, "models", "loras");
-    const outputPath = path.join(trimmed, "output");
-    const outputsPath = path.join(trimmed, "outputs");
-    const lorasExists =
-      fs.existsSync(lorasPath) && fs.statSync(lorasPath).isDirectory();
+    const isDir = (target: string) => {
+      try {
+        return fs.existsSync(target) && fs.statSync(target).isDirectory();
+      } catch {
+        return false;
+      }
+    };
+    const lorasExists = isDir(path.join(trimmed, "models", "loras"));
     const outputExists =
-      (fs.existsSync(outputPath) && fs.statSync(outputPath).isDirectory()) ||
-      (fs.existsSync(outputsPath) && fs.statSync(outputsPath).isDirectory());
+      isDir(path.join(trimmed, "output")) || isDir(path.join(trimmed, "outputs"));
     return {
       valid: lorasExists && outputExists,
       lorasExists,
@@ -752,9 +950,9 @@ ipcMain.handle("civitai:search", async (_e, query: string) => {
 ipcMain.handle(
   "comfyui:validateResources",
   async (_e, resources: ResourceInfo[]) => {
-    if (!resources || resources.length === 0)
+    if (!Array.isArray(resources) || resources.length === 0)
       return { valid: true, missing: [] };
-    const loras = parseResourcesForLoras(resources);
+    const loras = parseResourcesForLoras(resources.slice(0, MAX_RESOURCES));
     const lorasPath = getLorasPath();
     const missing: Array<{
       modelVersionId: number;
@@ -789,14 +987,19 @@ ipcMain.handle(
 ipcMain.handle("comfyui:status", async () => {
   try {
     const base = comfyUiBaseUrl.replace(/\/$/, "");
-    const res = await fetch(`${base}/queue`);
+    const res = await fetch(`${base}/queue`, {
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
     if (!res.ok) {
       return { connected: false, queue_running: [], queue_pending: [] };
     }
-    const data = (await res.json()) as {
+    const data = await readJson<{
       queue_running?: unknown[];
       queue_pending?: unknown[];
-    };
+    }>(res);
+    if (!data) {
+      return { connected: false, queue_running: [], queue_pending: [] };
+    }
     return {
       connected: true,
       queue_running: data.queue_running ?? [],
@@ -807,34 +1010,41 @@ ipcMain.handle("comfyui:status", async () => {
   }
 });
 
-ipcMain.handle("comfyui:history", async (_e, promptId: string) => {
-  if (!promptId) {
+ipcMain.handle("comfyui:history", async (_e, promptId: unknown) => {
+  if (!isPromptId(promptId)) {
     return { status: "error", error: "prompt_id required" };
   }
   const base = comfyUiBaseUrl.replace(/\/$/, "");
   try {
-    let res = await fetch(`${base}/history/${promptId}`);
+    let res = await fetch(`${base}/history/${encodeURIComponent(promptId)}`, {
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
+    });
     if (res.status === 404) {
-      res = await fetch(`${base}/history`);
+      res = await fetch(`${base}/history`, {
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
     }
     if (!res.ok) {
-      return { status: "error", error: res.statusText };
+      return { status: "error", error: res.statusText || "ComfyUI request failed" };
     }
-    const data = (await res.json()) as Record<
-      string,
-      {
-        outputs?: Record<
-          string,
-          {
-            images?: Array<{
-              filename: string;
-              subfolder?: string;
-              type?: string;
-            }>;
-          }
-        >;
-      }
-    >;
+    const data = await readJson<
+      Record<
+        string,
+        {
+          outputs?: Record<
+            string,
+            {
+              images?: Array<{
+                filename: string;
+                subfolder?: string;
+                type?: string;
+              }>;
+            }
+          >;
+        }
+      >
+    >(res);
+    if (!data) return { status: "error", error: "ComfyUI returned an unreadable response" };
     const entry = data[promptId];
     if (!entry) {
       return { status: "pending", prompt_id: promptId };
@@ -862,19 +1072,30 @@ ipcMain.handle("comfyui:history", async (_e, promptId: string) => {
 
 ipcMain.handle(
   "comfyui:view",
-  async (_e, filename: string, subfolder?: string, type?: string) => {
+  async (_e, filename: unknown, subfolder?: unknown, type?: unknown) => {
+    if (!isSafeComfyName(filename)) return null;
+    const folder = typeof subfolder === "string" ? subfolder : "";
+    if (folder.includes("\0") || folder.includes("..")) return null;
+    const viewType = type === "input" || type === "temp" ? type : "output";
     const base = comfyUiBaseUrl.replace(/\/$/, "");
     const params = new URLSearchParams({
       filename,
-      subfolder: subfolder ?? "",
-      type: type ?? "output",
+      subfolder: folder,
+      type: viewType,
     });
-    const res = await fetch(`${base}/view?${params.toString()}`);
-    if (!res.ok) {
+    try {
+      const res = await fetch(`${base}/view?${params.toString()}`, {
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+      if (!res.ok) return null;
+      const declared = parseByteCount(res.headers.get("content-length"));
+      if (declared != null && declared > MAX_VIEW_BYTES) return null;
+      const buffer = await res.arrayBuffer();
+      if (buffer.byteLength > MAX_VIEW_BYTES) return null;
+      return Array.from(new Uint8Array(buffer));
+    } catch {
       return null;
     }
-    const buffer = await res.arrayBuffer();
-    return Array.from(new Uint8Array(buffer));
   },
 );
 
@@ -899,21 +1120,33 @@ ipcMain.handle("comfyui:queue", async (_e, params: QueueParams) => {
     loras,
   } = params ?? {};
 
-  if (!prompt || typeof prompt !== "string") {
-    console.log("[ComfyUI] error: prompt is required");
+  if (!prompt || typeof prompt !== "string" || prompt.length > MAX_PROMPT_LENGTH) {
     return { error: "prompt is required" };
   }
   const workflowSource = params.workflow;
-  if (!workflowSource || Array.isArray(workflowSource)) {
+  if (
+    !workflowSource ||
+    typeof workflowSource !== "object" ||
+    Array.isArray(workflowSource)
+  ) {
     return {
       error: "Workflow is required. Upload an API workflow in Settings.",
     };
   }
   const mapping = params.workflowMapping ?? {};
-  const workflow = JSON.parse(JSON.stringify(workflowSource)) as Record<
-    string,
-    { inputs?: Record<string, unknown> }
-  >;
+  let workflow: Record<string, { inputs?: Record<string, unknown> }>;
+  try {
+    const serialized = JSON.stringify(workflowSource);
+    if (serialized.length > 2_000_000) {
+      return { error: "Workflow JSON is too large." };
+    }
+    workflow = JSON.parse(serialized) as Record<
+      string,
+      { inputs?: Record<string, unknown> }
+    >;
+  } catch {
+    return { error: "Workflow JSON is invalid." };
+  }
   const promptNodeId = mapping.promptNodeId?.trim();
   if (!promptNodeId) {
     return { error: "Workflow mapping required: prompt node." };
@@ -939,29 +1172,36 @@ ipcMain.handle("comfyui:queue", async (_e, params: QueueParams) => {
       seed: Math.floor(Math.random() * 2 ** 32),
     };
   }
+  const safeFolder = sanitizeSaveFolder(saveImageFolder);
   if (
     saveImageFolder != null &&
-    typeof saveImageFolder === "string" &&
+    saveImageFolder !== "" &&
+    !safeFolder
+  ) {
+    return { error: "Save folder contains unsupported characters." };
+  }
+  if (
+    safeFolder &&
     mapping.saveImageNodeId &&
     workflow[mapping.saveImageNodeId]?.inputs
   ) {
     workflow[mapping.saveImageNodeId].inputs = {
       ...workflow[mapping.saveImageNodeId].inputs,
-      output_path: saveImageFolder,
+      output_path: safeFolder,
     };
   }
+  const safeWidth = parsePositiveInt(width, 8192);
+  const safeHeight = parsePositiveInt(height, 8192);
   if (
-    typeof width === "number" &&
-    typeof height === "number" &&
-    width > 0 &&
-    height > 0 &&
+    safeWidth &&
+    safeHeight &&
     mapping.resolutionNodeId &&
     workflow[mapping.resolutionNodeId]?.inputs
   ) {
     workflow[mapping.resolutionNodeId].inputs = {
       ...workflow[mapping.resolutionNodeId].inputs,
-      width: Math.round(width),
-      height: Math.round(height),
+      width: safeWidth,
+      height: safeHeight,
     };
   }
 
@@ -1003,14 +1243,15 @@ ipcMain.handle("comfyui:queue", async (_e, params: QueueParams) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: workflow,
-        client_id: `civit-ai-${Date.now()}`,
+        client_id: `lumina-${Date.now()}`,
       }),
+      signal: AbortSignal.timeout(API_TIMEOUT_MS),
     });
-    const data = (await res.json()) as {
+    const data = (await readJson<{
       prompt_id?: string;
       number?: number;
       error?: string;
-    };
+    }>(res)) ?? { error: "ComfyUI returned an unreadable response" };
     if (!res.ok) {
       console.log("[ComfyUI] POST failed:", data.error ?? res.statusText);
       return { error: data.error ?? "ComfyUI request failed" };
@@ -1038,6 +1279,9 @@ const createWindow = () => {
     frame: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
     },
   });
 
@@ -1073,18 +1317,25 @@ app.on("ready", () => {
   Menu.setApplicationMenu(null);
   protocol.handle("comfy-view", async (request) => {
     const url = new URL(request.url);
-    const filename = url.searchParams.get("filename");
+    const filename = url.searchParams.get("filename") ?? "";
     const subfolder = url.searchParams.get("subfolder") ?? "";
-    const type = url.searchParams.get("type") ?? "output";
-    if (!filename) {
+    const requestedType = url.searchParams.get("type") ?? "output";
+    const type =
+      requestedType === "input" || requestedType === "temp"
+        ? requestedType
+        : "output";
+    if (!isSafeComfyName(filename) || subfolder.includes("..") || subfolder.includes("\0")) {
       return new Response("Missing filename", { status: 400 });
     }
     const base = comfyUiBaseUrl.replace(/\/$/, "");
     const params = new URLSearchParams({ filename, subfolder, type });
     try {
-      const res = await fetch(`${base}/view?${params.toString()}`);
+      const res = await fetch(`${base}/view?${params.toString()}`, {
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+      const contentType = res.headers.get("content-type") ?? "application/octet-stream";
       return new Response(res.body, {
-        headers: res.headers,
+        headers: { "content-type": contentType },
         status: res.status,
       });
     } catch {

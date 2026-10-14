@@ -35,17 +35,27 @@ export function ComfyUIProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    window.api.comfyuiSetUrl(getStoredComfyUrl());
-    window.api.comfyuiSetBasePath(getStoredComfyBasePath());
-    window.api.civitaiSetApiKey(getStoredCivitaiApiKey());
+    void window.api?.comfyuiSetUrl(getStoredComfyUrl());
+    void window.api?.comfyuiSetBasePath(getStoredComfyBasePath());
+    void window.api?.civitaiSetApiKey(getStoredCivitaiApiKey());
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
-      getComfyUIStatus().then((data) => {
-        if (!cancelled) setStatus(data);
-      });
+      getComfyUIStatus()
+        .then((data) => {
+          if (!cancelled) setStatus(data);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setStatus({
+              connected: false,
+              queue_running: [],
+              queue_pending: [],
+            });
+          }
+        });
     };
     tick();
     const id = setInterval(tick, POLL_INTERVAL_MS);

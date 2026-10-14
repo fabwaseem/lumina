@@ -1,3 +1,5 @@
+import type { ResourceInfo } from "./types";
+
 export {};
 
 interface DownloadProgressData {
@@ -13,6 +15,7 @@ interface DownloadProgressData {
   createdAt: number;
   completedAt?: number;
   modelVersionId?: number;
+  hash?: string;
   resourceName?: string;
 }
 
@@ -29,6 +32,7 @@ interface DownloadListItem {
   createdAt: number;
   completedAt?: number;
   modelVersionId?: number;
+  hash?: string;
   resourceName?: string;
 }
 

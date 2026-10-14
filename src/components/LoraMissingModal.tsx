@@ -93,7 +93,7 @@ export function LoraMissingModal({
           setCompleted((prev) => ({ ...prev, [lora.name]: true }));
           setDownloading((prev) => ({ ...prev, [lora.name]: false }));
         }
-      } catch (e) {
+      } catch {
         setErrors((prev) => ({ ...prev, [lora.name]: "Failed to start" }));
         setDownloading((prev) => ({ ...prev, [lora.name]: false }));
       }

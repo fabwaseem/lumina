@@ -6,13 +6,14 @@ import {
   type ReactNode,
 } from "react";
 import type { ThemeContextType } from "@/types";
+import { readStorage, writeStorage } from "@/lib/validate";
 
 const ThemeContext = createContext<ThemeContextType | null>(null);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [isDark, setIsDark] = useState(() => {
     if (typeof window !== "undefined") {
-      const stored = localStorage.getItem("theme");
+      const stored = readStorage("theme");
       if (stored) return stored === "dark";
       return window.matchMedia("(prefers-color-scheme: dark)").matches;
     }
@@ -26,7 +27,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     } else {
       root.classList.remove("dark");
     }
-    localStorage.setItem("theme", isDark ? "dark" : "light");
+    writeStorage("theme", isDark ? "dark" : "light");
   }, [isDark]);
 
   const toggle = () => setIsDark(!isDark);

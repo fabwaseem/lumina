@@ -1,7 +1,10 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
+import { installBrowserApiFallback } from "./lib/browserApi";
 import { App } from "./App";
+
+installBrowserApiFallback();
 
 const root = document.getElementById("root");
 if (!root) {
