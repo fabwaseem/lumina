@@ -89,26 +89,27 @@ export function Lightbox() {
     );
 
     loraResources.forEach(async (resource) => {
-      if (!resource.hash) return;
+      const hash = resource.hash;
+      if (!hash) return;
       setLoraStates((prev) => ({
         ...prev,
-        [resource.hash!]: { status: "checking" },
+        [hash]: { status: "checking" },
       }));
       try {
         const result = await checkExists({
-          hash: resource.hash,
+          hash,
           name: resource.name,
         });
         setLoraStates((prev) => ({
           ...prev,
-          [resource.hash!]: {
+          [hash]: {
             status: result.exists ? "exists" : "idle",
           },
         }));
       } catch {
         setLoraStates((prev) => ({
           ...prev,
-          [resource.hash!]: { status: "idle" },
+          [hash]: { status: "idle" },
         }));
       }
     });
@@ -171,11 +172,20 @@ export function Lightbox() {
     const ext =
       /\.(png|jpe?g|webp|gif)$/i.exec(selectedImage.url)?.[1] ?? "png";
     const suggestedName = `lumina-${selectedImage.id}.${ext}`;
-    const result = await window.api.downloadImage(
-      selectedImage.url,
-      suggestedName,
-      getStoredDownloadPath(),
-    );
+    let result: { path?: string; error?: string };
+    try {
+      result = await window.api.downloadImage(
+        selectedImage.url,
+        suggestedName,
+        getStoredDownloadPath(),
+      );
+    } catch (err) {
+      setDownloadError(
+        err instanceof Error ? err.message : "Download failed",
+      );
+      setDownloadState("error");
+      return;
+    }
     if (result.error) {
       setDownloadError(result.error);
       setDownloadState("error");
@@ -233,7 +243,11 @@ export function Lightbox() {
   }, [selectedImage, handleClose, handlePrev, handleNext]);
 
   const copyToClipboard = async (text: string, type: "prompt" | "negative") => {
-    await navigator.clipboard.writeText(text);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
     if (type === "prompt") {
       setCopiedPrompt(true);
       setTimeout(() => setCopiedPrompt(false), 2000);
@@ -255,19 +269,18 @@ export function Lightbox() {
     }
     setIsSending(true);
 
-    if (autoLora) {
-      const validation = await window.api.comfyuiValidateResources(
-        image.meta.resources,
-      );
-      if (!validation.valid && validation.missing.length > 0) {
-        setMissingLoras(validation.missing);
-        setShowMissingModal(true);
-        setIsSending(false);
-        return;
-      }
-    }
-
     try {
+      if (autoLora && image.meta.resources) {
+        const validation = await window.api.comfyuiValidateResources(
+          image.meta.resources,
+        );
+        if (!validation.valid && validation.missing.length > 0) {
+          setMissingLoras(validation.missing);
+          setShowMissingModal(true);
+          return;
+        }
+      }
+
       const result = await queueComfyUI({
         prompt: image.meta.prompt,
         negativePrompt: image.meta.negativePrompt,
@@ -278,7 +291,7 @@ export function Lightbox() {
       });
       if (result.prompt_id) setComfyPromptId(result.prompt_id);
     } catch {
-      setIsSending(false);
+      setComfyPromptId(null);
     } finally {
       setIsSending(false);
     }
@@ -373,7 +386,7 @@ export function Lightbox() {
                     Prompt
                   </h3>
                   <button
-                    onClick={() => copyToClipboard(meta.prompt!, "prompt")}
+                    onClick={() => copyToClipboard(meta.prompt ?? "", "prompt")}
                     className="btn btn-ghost p-1.5 text-xs"
                   >
                     {copiedPrompt ? (
@@ -425,7 +438,7 @@ export function Lightbox() {
                   </h3>
                   <button
                     onClick={() =>
-                      copyToClipboard(meta.negativePrompt!, "negative")
+                      copyToClipboard(meta.negativePrompt ?? "", "negative")
                     }
                     className="btn btn-ghost p-1.5 text-xs"
                   >
@@ -510,9 +523,10 @@ export function Lightbox() {
                   <div className="space-y-2">
                     {meta.resources.map((resource, index) => {
                       const isLora = resource.type?.toLowerCase() === "lora";
-                      const hasHash = resource.hash !== undefined;
+                      const hash = resource.hash;
+                      const hasHash = typeof hash === "string" && hash.length > 0;
                       const downloadStatus = hasHash
-                        ? getLoraDownloadStatus(resource.hash!)
+                        ? getLoraDownloadStatus(hash)
                         : null;
 
                       return (
@@ -540,10 +554,8 @@ export function Lightbox() {
                                   {downloadStatus?.status === "idle" && (
                                     <button
                                       onClick={() =>
-                                        handleLoraDownload(
-                                          resource.hash!,
-                                          resource.name,
-                                        )
+                                        hash &&
+                                        handleLoraDownload(hash, resource.name)
                                       }
                                       className="p-1.5 hover:bg-surface-200 dark:hover:bg-surface-700 rounded transition-colors text-primary-500"
                                       title="Download LoRA"
@@ -564,10 +576,8 @@ export function Lightbox() {
                                   {downloadStatus?.status === "error" && (
                                     <button
                                       onClick={() =>
-                                        handleLoraDownload(
-                                          resource.hash!,
-                                          resource.name,
-                                        )
+                                        hash &&
+                                        handleLoraDownload(hash, resource.name)
                                       }
                                       className="p-1.5 hover:bg-surface-200 dark:hover:bg-surface-700 rounded transition-colors text-red-500"
                                       title={

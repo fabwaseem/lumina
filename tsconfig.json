@@ -17,5 +17,6 @@
     },
     "lib": ["ESNext", "DOM", "DOM.Iterable"]
   },
-  "include": ["src", "forge.config.ts", "vite.*.config.ts"]
+  "include": ["src", "forge.config.ts", "vite.*.config.ts"],
+  "exclude": ["src/**/*.test.mts"]
 }

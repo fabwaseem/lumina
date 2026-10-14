@@ -57,6 +57,7 @@ contextBridge.exposeInMainWorld("api", {
       createdAt: number;
       completedAt?: number;
       modelVersionId?: number;
+      hash?: string;
       resourceName?: string;
     }) => void,
   ) => {

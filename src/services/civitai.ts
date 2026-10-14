@@ -4,36 +4,25 @@ import type {
   ImageFilters,
 } from "@/types";
 import { Models as BASE_MODEL_OPTIONS } from "@/data/civitai";
+import { readStorage, sanitizeCursor, sanitizeQuery, sanitizeUsername, writeStorage } from "@/lib/validate";
 
 const API_BASE = "https://civitai.com/api/v1";
 const MAX_FETCH_ATTEMPTS = 5;
 const CIVITAI_API_KEY_STORAGE = "civitai-api-key";
 
 export function getStoredCivitaiApiKey(): string {
-  try {
-    return localStorage.getItem(CIVITAI_API_KEY_STORAGE) ?? "";
-  } catch {
-    return "";
-  }
+  return readStorage(CIVITAI_API_KEY_STORAGE) ?? "";
 }
 
 export function setStoredCivitaiApiKey(key: string): void {
-  try {
-    localStorage.setItem(CIVITAI_API_KEY_STORAGE, key);
-  } catch {
-    void 0;
-  }
+  writeStorage(CIVITAI_API_KEY_STORAGE, key);
 }
 
 function applyClientFilters(images: CivitAIImage[]): CivitAIImage[] {
   return images.filter((image) => {
-    if (!image.meta?.prompt) {
-      return false;
-    }
-    if (image.meta?.prompt.split(" ").length < 10) {
-      return false;
-    }
-    return true;
+    const prompt = image?.meta?.prompt;
+    if (typeof prompt !== "string") return false;
+    return prompt.trim().split(/\s+/).length >= 10;
   });
 }
 
@@ -47,8 +36,9 @@ async function fetchSinglePage(
   params.set("useIndex", "true");
   params.set("type", "image");
 
-  if (filters.query) {
-    params.set("query", filters.query);
+  const query = sanitizeQuery(filters.query);
+  if (query) {
+    params.set("query", query);
   }
   if (filters.sort) {
     params.set("sort", filters.sort);
@@ -56,16 +46,21 @@ async function fetchSinglePage(
   if (filters.period && filters.period !== "AllTime") {
     params.set("period", filters.period);
   }
-  if (filters.username) {
-    params.set("username", filters.username);
+  const username = sanitizeUsername(filters.username);
+  if (username) {
+    params.set("username", username);
   }
-  if (filters.postId != null) {
+  if (filters.postId != null && Number.isInteger(filters.postId) && filters.postId > 0) {
     params.set("postId", filters.postId.toString());
   }
-  if (filters.modelId != null) {
+  if (filters.modelId != null && Number.isInteger(filters.modelId) && filters.modelId > 0) {
     params.set("modelId", filters.modelId.toString());
   }
-  if (filters.modelVersionId != null) {
+  if (
+    filters.modelVersionId != null &&
+    Number.isInteger(filters.modelVersionId) &&
+    filters.modelVersionId > 0
+  ) {
     params.set("modelVersionId", filters.modelVersionId.toString());
   }
   if (filters.baseModels && filters.baseModels.length > 0) {
@@ -82,19 +77,47 @@ async function fetchSinglePage(
   if (filters.nsfwLevel && nsfwMap[filters.nsfwLevel]) {
     params.set("nsfw", filters.nsfwLevel === "None" ? "false" : "true");
   }
-  if (cursor) {
-    params.set("cursor", cursor);
+  const safeCursor = sanitizeCursor(cursor);
+  if (safeCursor) {
+    params.set("cursor", safeCursor);
   }
-  const apiKey = getStoredCivitaiApiKey();
-  if (apiKey) {
-    params.set("apiKey", apiKey);
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const apiKey = getStoredCivitaiApiKey().trim();
+  if (apiKey && !/\s/.test(apiKey)) {
+    headers.Authorization = `Bearer ${apiKey}`;
   }
 
-  const response = await fetch(`${API_BASE}/images?${params.toString()}`);
-  if (!response.ok) {
-    throw new Error(`API Error: ${response.status}`);
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/images?${params.toString()}`, {
+      headers,
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") {
+      throw new Error("CivitAI request timed out");
+    }
+    throw new Error("Could not reach CivitAI");
   }
-  return response.json();
+  if (response.status === 401 || response.status === 403) {
+    throw new Error("CivitAI rejected the API key");
+  }
+  if (!response.ok) {
+    throw new Error(`CivitAI request failed (${response.status})`);
+  }
+  let payload: CivitAIImagesResponse;
+  try {
+    payload = (await response.json()) as CivitAIImagesResponse;
+  } catch {
+    throw new Error("CivitAI returned an unreadable response");
+  }
+  if (!payload || !Array.isArray(payload.items)) {
+    throw new Error("CivitAI returned an unexpected response");
+  }
+  return {
+    items: payload.items,
+    metadata: payload.metadata ?? {},
+  };
 }
 
 export async function fetchImages(
@@ -129,8 +152,12 @@ export async function fetchImages(
 }
 
 export function getOptimizedImageUrl(url: string, width = 450): string {
+  if (!url || typeof url !== "string") return "";
+  const safeWidth = Number.isFinite(width)
+    ? Math.max(64, Math.min(2048, Math.round(width)))
+    : 450;
   if (url.includes("/width=")) {
-    return url.replace(/\/width=\d+/, `/width=${width}`);
+    return url.replace(/\/width=\d+/, `/width=${safeWidth}`);
   }
   return url;
 }

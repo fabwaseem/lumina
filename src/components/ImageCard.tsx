@@ -61,20 +61,18 @@ export function ImageCard({ image, viewMode, onClick }: ImageCardProps) {
     }
     setIsSending(true);
 
-    if (autoLora) {
-      const validation = await window.api.comfyuiValidateResources(
-        image.meta.resources,
-      );
-      if (!validation.valid && validation.missing.length > 0) {
-        setMissingLoras(validation.missing);
-        setShowMissingModal(true);
-        setIsSending(false);
-        return;
-      }
-    }
-
-    setIsSending(true);
     try {
+      if (autoLora && image.meta?.resources) {
+        const validation = await window.api.comfyuiValidateResources(
+          image.meta.resources,
+        );
+        if (!validation.valid && validation.missing.length > 0) {
+          setMissingLoras(validation.missing);
+          setShowMissingModal(true);
+          return;
+        }
+      }
+
       const result = await queueComfyUI({
         prompt: image.meta.prompt,
         negativePrompt: image.meta.negativePrompt,
@@ -99,15 +97,19 @@ export function ImageCard({ image, viewMode, onClick }: ImageCardProps) {
     const ext =
       /\.(png|jpe?g|webp|gif)$/i.exec(image.url)?.[1]?.toLowerCase() ?? "png";
     const suggestedName = `lumina-${image.id}.${ext}`;
-    const result = await window.api.downloadImage(
-      image.url,
-      suggestedName,
-      getStoredDownloadPath(),
-    );
-    setIsDownloading(false);
-    if (!result.error) {
-      setDownloadDone(true);
-      setTimeout(() => setDownloadDone(false), 2000);
+    try {
+      const result = await window.api.downloadImage(
+        image.url,
+        suggestedName,
+        getStoredDownloadPath(),
+      );
+      setIsDownloading(false);
+      if (!result.error) {
+        setDownloadDone(true);
+        setTimeout(() => setDownloadDone(false), 2000);
+      }
+    } catch {
+      setIsDownloading(false);
     }
   };
 

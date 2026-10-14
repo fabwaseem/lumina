@@ -48,8 +48,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setMaxDownloadSize = useCallback((value: number) => {
-    setMaxDownloadSizeState(value);
-    setStoredMaxDownloadSize(value);
+    const safe = Math.max(0, Math.min(20480, Number.isFinite(value) ? value : 0));
+    setMaxDownloadSizeState(safe);
+    setStoredMaxDownloadSize(safe);
   }, []);
 
   const setMaxConcurrentDownloads = useCallback((value: number) => {
@@ -76,7 +77,14 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    window.api.downloadSetMaxConcurrent(maxConcurrentDownloads);
+    const apply = async () => {
+      try {
+        await window.api?.downloadSetMaxConcurrent(maxConcurrentDownloads);
+      } catch {
+        return;
+      }
+    };
+    void apply();
   }, [maxConcurrentDownloads]);
 
   return (

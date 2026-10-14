@@ -1,3 +1,10 @@
+import {
+  isHttpUrl,
+  readStorage,
+  removeStorage,
+  writeStorage,
+} from "@/lib/validate";
+
 const COMFYUI_URL_KEY = "comfyui-url";
 const COMFYUI_BASE_PATH_KEY = "comfyui-base-path";
 const COMFYUI_WORKFLOW_KEY = "comfyui-workflow";
@@ -5,29 +12,25 @@ const COMFYUI_WORKFLOW_MAPPING_KEY = "comfyui-workflow-mapping";
 const DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188";
 
 export function getStoredComfyUrl(): string {
-  if (typeof window === "undefined") return DEFAULT_COMFYUI_URL;
-  const stored = localStorage.getItem(COMFYUI_URL_KEY);
-  return stored?.trim() || DEFAULT_COMFYUI_URL;
+  const stored = readStorage(COMFYUI_URL_KEY)?.trim() ?? "";
+  return isHttpUrl(stored) ? stored.replace(/\/$/, "") : DEFAULT_COMFYUI_URL;
 }
 
 export function setStoredComfyUrl(url: string): void {
-  if (typeof window === "undefined") return;
-  const value = url?.trim() || DEFAULT_COMFYUI_URL;
-  localStorage.setItem(COMFYUI_URL_KEY, value);
-  window.api.comfyuiSetUrl(value);
+  const value = url?.trim().replace(/\/$/, "") || DEFAULT_COMFYUI_URL;
+  if (!isHttpUrl(value)) return;
+  writeStorage(COMFYUI_URL_KEY, value);
+  void window.api?.comfyuiSetUrl(value);
 }
 
 export function getStoredComfyBasePath(): string {
-  if (typeof window === "undefined") return "";
-  const stored = localStorage.getItem(COMFYUI_BASE_PATH_KEY);
-  return stored?.trim() ?? "";
+  return readStorage(COMFYUI_BASE_PATH_KEY)?.trim() ?? "";
 }
 
 export function setStoredComfyBasePath(basePath: string): void {
-  if (typeof window === "undefined") return;
-  const value = basePath?.trim() ?? "";
-  localStorage.setItem(COMFYUI_BASE_PATH_KEY, value);
-  window.api.comfyuiSetBasePath(value);
+  const value = basePath?.trim().split("\u0000").join("") ?? "";
+  writeStorage(COMFYUI_BASE_PATH_KEY, value);
+  void window.api?.comfyuiSetBasePath(value);
 }
 
 export interface WorkflowNodeMapping {
@@ -44,50 +47,47 @@ export type ComfyWorkflow = Record<
   { inputs?: Record<string, unknown>; class_type?: string; _meta?: unknown }
 >;
 
-export function getStoredComfyWorkflow(): ComfyWorkflow | null {
-  if (typeof window === "undefined") return null;
-  const raw = localStorage.getItem(COMFYUI_WORKFLOW_KEY);
-  if (!raw) return null;
+function parseStoredJson(raw: string | null): unknown {
+  if (!raw || raw.length > 2_000_000) return null;
   try {
-    const parsed = JSON.parse(raw) as ComfyWorkflow;
-    if (!parsed || Array.isArray(parsed)) return null;
-    return parsed;
+    return JSON.parse(raw) as unknown;
   } catch {
     return null;
   }
+}
+
+export function getStoredComfyWorkflow(): ComfyWorkflow | null {
+  const parsed = parseStoredJson(readStorage(COMFYUI_WORKFLOW_KEY));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsed as ComfyWorkflow;
 }
 
 export function setStoredComfyWorkflow(workflow: ComfyWorkflow | null): void {
-  if (typeof window === "undefined") return;
   if (!workflow) {
-    localStorage.removeItem(COMFYUI_WORKFLOW_KEY);
+    removeStorage(COMFYUI_WORKFLOW_KEY);
     return;
   }
-  localStorage.setItem(COMFYUI_WORKFLOW_KEY, JSON.stringify(workflow));
+  writeStorage(COMFYUI_WORKFLOW_KEY, JSON.stringify(workflow));
 }
 
 export function getStoredComfyWorkflowMapping(): WorkflowNodeMapping | null {
-  if (typeof window === "undefined") return null;
-  const raw = localStorage.getItem(COMFYUI_WORKFLOW_MAPPING_KEY);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw) as WorkflowNodeMapping;
-    if (!parsed?.promptNodeId) return null;
-    return parsed;
-  } catch {
+  const parsed = parseStoredJson(readStorage(COMFYUI_WORKFLOW_MAPPING_KEY));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const mapping = parsed as WorkflowNodeMapping;
+  if (typeof mapping.promptNodeId !== "string" || !mapping.promptNodeId.trim()) {
     return null;
   }
+  return mapping;
 }
 
 export function setStoredComfyWorkflowMapping(
   mapping: WorkflowNodeMapping | null,
 ): void {
-  if (typeof window === "undefined") return;
   if (!mapping) {
-    localStorage.removeItem(COMFYUI_WORKFLOW_MAPPING_KEY);
+    removeStorage(COMFYUI_WORKFLOW_MAPPING_KEY);
     return;
   }
-  localStorage.setItem(COMFYUI_WORKFLOW_MAPPING_KEY, JSON.stringify(mapping));
+  writeStorage(COMFYUI_WORKFLOW_MAPPING_KEY, JSON.stringify(mapping));
 }
 
 export interface QueueComfyUIParams {
@@ -128,6 +128,9 @@ export interface ComfyUIHistoryResult {
 export async function queueComfyUI(
   params: QueueComfyUIParams
 ): Promise<QueueComfyUIResult> {
+  if (!window.api?.comfyuiQueue) {
+    throw new Error("ComfyUI is unavailable");
+  }
   const workflow = getStoredComfyWorkflow();
   const workflowMapping = getStoredComfyWorkflowMapping();
   const data = await window.api.comfyuiQueue({
@@ -146,21 +149,31 @@ export async function queueComfyUI(
 }
 
 export async function getComfyUIStatus(): Promise<ComfyUIStatusResult> {
-  const data = await window.api.comfyuiStatus();
-  return {
-    connected: data.connected ?? false,
-    queue_running: (data.queue_running ?? []) as Array<
-      [string, number, unknown]
-    >,
-    queue_pending: (data.queue_pending ?? []) as Array<
-      [string, number, unknown]
-    >,
-  };
+  if (!window.api?.comfyuiStatus) {
+    return { connected: false, queue_running: [], queue_pending: [] };
+  }
+  try {
+    const data = await window.api.comfyuiStatus();
+    return {
+      connected: data.connected ?? false,
+      queue_running: (data.queue_running ?? []) as Array<
+        [string, number, unknown]
+      >,
+      queue_pending: (data.queue_pending ?? []) as Array<
+        [string, number, unknown]
+      >,
+    };
+  } catch {
+    return { connected: false, queue_running: [], queue_pending: [] };
+  }
 }
 
 export async function getComfyUIHistory(
   promptId: string
 ): Promise<ComfyUIHistoryResult> {
+  if (!window.api?.comfyuiHistory) {
+    return { status: "error", error: "ComfyUI is unavailable" };
+  }
   const data = await window.api.comfyuiHistory(promptId);
   if (data.status === "done") {
     return {

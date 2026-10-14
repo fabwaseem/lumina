@@ -25,8 +25,8 @@ export function useComfyUIJob(promptId: string | null): ComfyUIJobState {
 
   const poll = useCallback(() => {
     if (!promptId) return;
-    Promise.all([getComfyUIHistory(promptId), getComfyUIStatus()]).then(
-      ([historyResult, status]) => {
+    Promise.all([getComfyUIHistory(promptId), getComfyUIStatus()])
+      .then(([historyResult, status]) => {
         if (historyResult.status === "done") {
           setState({
             phase: "done",
@@ -62,8 +62,14 @@ export function useComfyUIJob(promptId: string | null): ComfyUIJobState {
           doneImage: null,
           error: null,
         }));
-      }
-    );
+      })
+      .catch((err: unknown) => {
+        setState((prev) => ({
+          ...prev,
+          phase: "error",
+          error: err instanceof Error ? err.message : "ComfyUI request failed",
+        }));
+      });
   }, [promptId]);
 
   useEffect(() => {

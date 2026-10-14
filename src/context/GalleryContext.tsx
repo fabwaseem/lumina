@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   type ReactNode,
 } from "react";
 import type {
@@ -15,6 +16,7 @@ import type {
 } from "@/types";
 import { useDebounce } from "@/hooks/useDebounce";
 import { fetchImages } from "@/services/civitai";
+import { readStorage, sanitizeFilters, writeStorage } from "@/lib/validate";
 
 export const defaultFilters: ImageFilters = {
   query: "",
@@ -26,36 +28,18 @@ export const defaultFilters: ImageFilters = {
 const STORAGE_KEY = "civitai-gallery-filters";
 
 function loadFiltersFromStorage(): ImageFilters {
-  if (typeof window === "undefined") return defaultFilters;
+  const raw = readStorage(STORAGE_KEY);
+  if (!raw) return defaultFilters;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultFilters;
     const parsed = JSON.parse(raw) as Partial<ImageFilters>;
-    return {
-      ...defaultFilters,
-      ...parsed,
-      query:
-        typeof parsed.query === "string" ? parsed.query : defaultFilters.query,
-      sort: parsed.sort ?? defaultFilters.sort,
-      period: parsed.period ?? defaultFilters.period,
-      nsfwLevel: parsed.nsfwLevel ?? defaultFilters.nsfwLevel,
-      baseModels: Array.isArray(parsed.baseModels)
-        ? parsed.baseModels
-        : defaultFilters.baseModels,
-    };
+    return sanitizeFilters(parsed, defaultFilters);
   } catch {
-    void 0;
     return defaultFilters;
   }
 }
 
 function saveFiltersToStorage(filters: ImageFilters): void {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(filters));
-  } catch {
-    void 0;
-  }
+  writeStorage(STORAGE_KEY, JSON.stringify(filters));
 }
 
 const GalleryContext = createContext<GalleryContextType | null>(null);
@@ -65,7 +49,6 @@ export function GalleryProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
-  const [cursor, setCursor] = useState<string | undefined>();
   const [filters, setFiltersState] = useState<ImageFilters>(
     loadFiltersFromStorage
   );
@@ -81,6 +64,9 @@ export function GalleryProvider({ children }: { children: ReactNode }) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [saveImageFolder, setSaveImageFolder] = useState("");
   const debouncedFilters = useDebounce(filters, 400);
+  const cursorRef = useRef<string | undefined>(undefined);
+  const generationRef = useRef(0);
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   const filteredImages = useMemo(() => {
     const hasModel = (img: CivitAIImage) => {
@@ -104,45 +90,45 @@ export function GalleryProvider({ children }: { children: ReactNode }) {
     return filteredImages.findIndex((img) => img.id === selectedImage.id);
   }, [selectedImage, filteredImages]);
 
-  const loadImages = useCallback(
-    async (isRefresh = false) => {
-      if (loading) return;
-      setLoading(true);
-      setError(null);
-      try {
-        const currentCursor = isRefresh ? undefined : cursor;
-        const response = await fetchImages(filters, currentCursor);
-        if (isRefresh) {
-          setImages(response.items);
-        } else {
-          setImages((prev) => [...prev, ...response.items]);
-        }
-        setCursor(response.metadata.nextCursor);
-        setHasMore(!!response.metadata.nextCursor);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load images");
-      } finally {
-        setLoading(false);
-      }
+  const applyPage = useCallback(
+    (generation: number, items: CivitAIImage[], nextCursor: string | undefined, append: boolean) => {
+      if (generation !== generationRef.current) return;
+      setImages((prev) => (append ? [...prev, ...items] : items));
+      cursorRef.current = nextCursor;
+      setHasMore(!!nextCursor);
+      setLoading(false);
     },
-    [filters, cursor, loading]
+    [],
   );
 
-  const refresh = useCallback(() => {
-    setCursor(undefined);
-    setImages([]);
-    setHasMore(true);
-    loadImages(true);
-  }, [loadImages]);
-
   const loadMore = useCallback(() => {
-    if (!loading && hasMore) {
-      loadImages(false);
-    }
-  }, [loading, hasMore, loadImages]);
+    if (loading || !hasMore || !cursorRef.current) return;
+    const generation = generationRef.current;
+    const cursor = cursorRef.current;
+    setLoading(true);
+    setError(null);
+    fetchImages(debouncedFilters, cursor)
+      .then((response) => {
+        applyPage(
+          generation,
+          response.items,
+          response.metadata.nextCursor,
+          true,
+        );
+      })
+      .catch((err: unknown) => {
+        if (generation !== generationRef.current) return;
+        setError(err instanceof Error ? err.message : "Failed to load images");
+        setLoading(false);
+      });
+  }, [loading, hasMore, debouncedFilters, applyPage]);
+
+  const refresh = useCallback(() => {
+    setRefreshNonce((value) => value + 1);
+  }, []);
 
   const setFilters = useCallback((newFilters: Partial<ImageFilters>) => {
-    setFiltersState((prev) => ({ ...prev, ...newFilters }));
+    setFiltersState((prev) => sanitizeFilters({ ...prev, ...newFilters }, prev));
   }, []);
 
   const setSelectedImage = useCallback((image: CivitAIImage | null) => {
@@ -170,11 +156,27 @@ export function GalleryProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    setCursor(undefined);
+    const generation = ++generationRef.current;
+    let cancelled = false;
+    cursorRef.current = undefined;
     setImages([]);
     setHasMore(true);
-    loadImages(true);
-  }, [debouncedFilters]);
+    setLoading(true);
+    setError(null);
+    fetchImages(debouncedFilters)
+      .then((response) => {
+        if (cancelled) return;
+        applyPage(generation, response.items, response.metadata.nextCursor, false);
+      })
+      .catch((err: unknown) => {
+        if (cancelled || generation !== generationRef.current) return;
+        setError(err instanceof Error ? err.message : "Failed to load images");
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedFilters, refreshNonce, applyPage]);
 
   return (
     <GalleryContext.Provider

@@ -1,6 +1,7 @@
 import { readdir, stat } from "fs/promises";
 import { createWriteStream } from "fs";
-import { join } from "path";
+import { join, basename } from "path";
+import { isModelHash, parsePositiveInt, sanitizeFilename } from "./lib/validate";
 
 const CIVITAI_API = "https://civitai.com/api/v1";
 const LORA_SLOTS = 8;
@@ -59,11 +60,21 @@ async function downloadToFileWithProgress(
   filename: string,
   onProgress: (p: LoraDownloadProgress) => void
 ): Promise<boolean> {
+  if (!parsePositiveInt(modelVersionId)) return false;
   const url = `https://civitai.com/api/download/models/${modelVersionId}${
     token ? `?token=${encodeURIComponent(token)}` : ""
   }`;
   console.log("[LoRA] download start", filename, "versionId", modelVersionId);
-  const res = await fetch(url, { redirect: "follow" });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(30 * 60 * 1000),
+    });
+  } catch (err) {
+    console.log("[LoRA] download failed", filename, err);
+    return false;
+  }
   if (!res.ok || !res.body) {
     console.log("[LoRA] download failed", filename, "status", res.status);
     return false;
@@ -127,8 +138,10 @@ async function getVersionInfo(
   let primaryName: string | null = null;
   if (modelVersionId != null && Number.isFinite(modelVersionId)) {
     console.log("[LoRA] getVersionInfo by modelVersionId", modelVersionId);
+    try {
     const res = await fetch(`${CIVITAI_API}/model-versions/${modelVersionId}`, {
       headers: civitaiToken ? { Authorization: `Bearer ${civitaiToken}` } : {},
+      signal: AbortSignal.timeout(20_000),
     });
     if (res.ok) {
       const ver = (await res.json()) as {
@@ -145,15 +158,21 @@ async function getVersionInfo(
         primaryName
       );
     }
+    } catch (err) {
+      console.log("[LoRA] getVersionInfo modelVersionId failed", err);
+    }
   }
-  if ((!versionId || !primaryName) && hash) {
+  if ((!versionId || !primaryName) && hash && isModelHash(hash)) {
     console.log("[LoRA] getVersionInfo by hash", hash);
-    const hashRes = await fetch(
-      `${CIVITAI_API}/model-versions/by-hash/${hash}`,
+      let hashRes: Response;
+      try {
+      hashRes = await fetch(
+      `${CIVITAI_API}/model-versions/by-hash/${encodeURIComponent(hash)}`,
       {
         headers: civitaiToken
           ? { Authorization: `Bearer ${civitaiToken}` }
           : {},
+        signal: AbortSignal.timeout(20_000),
       }
     );
     if (hashRes.ok) {
@@ -167,9 +186,15 @@ async function getVersionInfo(
       primaryName = primary?.name ?? primaryName;
       console.log("[LoRA] getVersionInfo hash result:", versionId, primaryName);
     }
+      } catch (err) {
+        console.log("[LoRA] getVersionInfo hash failed", err);
+      }
   }
   if (versionId != null && primaryName) {
-    return { versionId, primaryName };
+    return {
+      versionId,
+      primaryName: sanitizeFilename(basename(primaryName), "lora.safetensors"),
+    };
   }
   console.log("[LoRA] getVersionInfo no version found");
   return null;

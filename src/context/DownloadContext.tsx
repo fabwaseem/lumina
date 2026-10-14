@@ -79,10 +79,17 @@ export function DownloadProvider({ children }: DownloadProviderProps) {
   const [isPanelOpen, setIsPanelOpen] = useState(false);
 
   useEffect(() => {
-    window.api.downloadList().then((result) => {
-      setActiveDownloads(result.active as DownloadItem[]);
-      setDownloadHistory(result.history as DownloadItem[]);
-    });
+    if (!window.api?.downloadList) return;
+    window.api
+      .downloadList()
+      .then((result) => {
+        setActiveDownloads(result.active as DownloadItem[]);
+        setDownloadHistory(result.history as DownloadItem[]);
+      })
+      .catch(() => {
+        setActiveDownloads([]);
+        setDownloadHistory([]);
+      });
 
     const unsubscribe = window.api.onDownloadProgress((data) => {
       const item: DownloadItem = {
@@ -98,6 +105,7 @@ export function DownloadProvider({ children }: DownloadProviderProps) {
         createdAt: data.createdAt,
         completedAt: data.completedAt,
         modelVersionId: data.modelVersionId,
+        hash: data.hash,
         resourceName: data.resourceName,
       };
 
@@ -140,6 +148,9 @@ export function DownloadProvider({ children }: DownloadProviderProps) {
       error?: string;
       alreadyExists?: boolean;
     }> => {
+      if (!window.api?.downloadStart) {
+        return { success: false, error: "Downloads are unavailable" };
+      }
       const result = await window.api.downloadStart(params);
 
       if (result.alreadyExists) {
